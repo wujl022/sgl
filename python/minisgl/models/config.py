@@ -28,9 +28,10 @@ class ModelConfig:
     rotary_config: RotaryConfig
     hidden_act: str
     tie_word_embeddings: bool
+    quantize_config: dict | None = None
 
     @classmethod
-    def from_hf(cls, config: LlamaConfig) -> ModelConfig:
+    def from_hf(cls, config: LlamaConfig, *, quantize_config: dict | None = None) -> ModelConfig:
         num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
@@ -45,6 +46,7 @@ class ModelConfig:
             hidden_act=config.hidden_act,
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=tie_word_embeddings,
+            quantize_config=quantize_config,
             rotary_config=RotaryConfig(
                 head_dim=head_dim,
                 rotary_dim=head_dim,

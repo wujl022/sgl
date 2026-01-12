@@ -51,6 +51,13 @@ class BaseOP:
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
+    def process_weights_after_loading(self) -> None:
+        for name, param in self.__dict__.items():
+            if name.startswith("_"):
+                continue
+            if isinstance(param, BaseOP):
+                param.process_weights_after_loading()
+
 
 class StateLessOP(BaseOP):
     def __init__(self):
@@ -97,3 +104,7 @@ class OPList(BaseOP, Generic[T]):
             op.load_state_dict(state_dict, prefix=_concat_prefix(prefix, str(i)), _internal=True)
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    def process_weights_after_loading(self) -> None:
+        for op in self.op_list:
+            op.process_weights_after_loading()

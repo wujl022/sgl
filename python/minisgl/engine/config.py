@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List
 import torch
 from minisgl.distributed import DistributedInfo
 from minisgl.utils import cached_load_hf_config
+from minisgl.utils.hf import cached_load_hf_quantize_config
 
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
@@ -34,10 +35,14 @@ class EngineConfig:
         return cached_load_hf_config(self.model_path)
 
     @cached_property
+    def quantize_config(self) -> dict | None:
+        return cached_load_hf_quantize_config(self.model_path)
+
+    @cached_property
     def model_config(self) -> ModelConfig:
         from minisgl.models import ModelConfig
 
-        return ModelConfig.from_hf(self.hf_config)
+        return ModelConfig.from_hf(self.hf_config, quantize_config=self.quantize_config)
 
     @property
     def max_seq_len(self) -> int:

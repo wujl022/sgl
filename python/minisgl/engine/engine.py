@@ -54,6 +54,7 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_path, config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        self.model.process_weights_after_loading()
         self.num_pages = self.dummy_page = self._determine_num_pages(init_free_memory, config)
         self.kv_cache = create_kvcache(
             model_config=config.model_config,
@@ -138,10 +139,29 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {
-                k: v.to(self.dtype)
-                for k, v in load_hf_weight(config.model_path, self.device).items()
-            }
+            out: Dict[str, torch.Tensor] = {}
+            for k, v in load_hf_weight(
+                config.model_path,
+                self.device,
+                quantize_config=config.quantize_config,
+            ).items():
+                if v.is_floating_point():
+                    out[k] = v.to(self.dtype)
+                else:
+                    out[k] = v
+
+            qcfg = config.quantize_config or {}
+            quant_method = str(qcfg.get("quant_method", "")).lower()
+            is_gptq = quant_method == "gptq" or any(
+                k.endswith((".qweight", ".qzeros", ".scales", ".g_idx")) for k in out.keys()
+            )
+            if is_gptq:
+                expected_keys = set(self.model.state_dict().keys())
+                for k in list(out.keys()):
+                    if k.endswith(".bias") and k not in expected_keys:
+                        del out[k]
+
+            return out
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
