@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -14,6 +15,16 @@ if TYPE_CHECKING:
 
 
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
+    if os.environ.get("MINISGL_DEBUGPY", "0") == "1":
+        import debugpy
+
+        host = os.environ.get("MINISGL_DEBUGPY_HOST", "127.0.0.1")
+        base_port = int(os.environ.get("MINISGL_DEBUGPY_PORT", "5678"))
+        port = base_port + int(args.tp_info.rank)
+        debugpy.listen((host, port))
+        if args.tp_info.is_primary() or os.environ.get("MINISGL_DEBUGPY_WAIT_ALL", "0") == "1":
+            debugpy.wait_for_client()
+
     import torch
     from minisgl.scheduler import Scheduler
 
