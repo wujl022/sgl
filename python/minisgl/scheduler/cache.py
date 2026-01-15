@@ -3,19 +3,43 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from minisgl.kvcache import BaseCacheHandle, create_cache_manager
+from minisgl.kvcache import BaseCacheHandle, BaseCacheManager, create_cache_manager
 
 if TYPE_CHECKING:
     from .utils import PendingReq
 
 
 class CacheManager:
-    def __init__(self, device: torch.device, num_pages: int, type: str):
+    def __init__(
+        self,
+        device: torch.device,
+        num_pages: int,
+        type: str,
+        existing_manager: BaseCacheManager | None = None,
+        old_num_pages: int = 0,
+    ):
         # TODO: support page_size > 1
-        self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device)
         self.device = device
-        self.manager = create_cache_manager(device=device, type=type)
         self.num_pages = num_pages
+        
+        # Reuse existing Radix Tree if provided
+        if existing_manager is not None:
+            self.manager = existing_manager
+            # Update free_slots: add new pages (from old_num_pages to num_pages)
+            # Note: Old pages [0, old_num_pages) are already in the Radix Tree
+            # New pages [old_num_pages, num_pages) are free and available
+            if num_pages > old_num_pages:
+                new_pages = torch.arange(
+                    old_num_pages, num_pages, dtype=torch.int32, device=device
+                )
+                self._free_slots = new_pages
+            else:
+                # If new num_pages <= old_num_pages, all new pages are already in use
+                # This shouldn't happen in normal usage, but handle it gracefully
+                self._free_slots = torch.empty(0, dtype=torch.int32, device=device)
+        else:
+            self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device)
+            self.manager = create_cache_manager(device=device, type=type)
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:

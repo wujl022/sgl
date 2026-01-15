@@ -21,7 +21,11 @@ _TP_INFO: DistributedInfo | None = None
 def set_tp_info(rank: int, size: int) -> None:
     global _TP_INFO
     if _TP_INFO is not None:
-        raise RuntimeError("TP info has been set")
+        if _TP_INFO.rank == rank and _TP_INFO.size == size:
+            return
+        raise RuntimeError(
+            f"TP info has been set (existing rank={_TP_INFO.rank}, size={_TP_INFO.size}; new rank={rank}, size={size})"
+        )
     _TP_INFO = DistributedInfo(rank, size)
 
 

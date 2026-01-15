@@ -46,6 +46,56 @@ class MHAKVCache(BaseKVCache):
         self._v_buffer = self._kv_buffer[1]
         self._device = device
         self._storage_shape = (num_pages, local_kv_heads, head_dim)
+        self._num_kv_heads = num_kv_heads
+        self._head_dim = head_dim
+        self._kv_layout = kv_layout
+
+    def extend(self, new_num_pages: int) -> MHAKVCache:
+        """
+        Extend the KV cache buffer by adding `new_num_pages` pages.
+        Returns a new MHAKVCache with extended buffer, preserving old data.
+        """
+        old_num_pages = self._kv_buffer.shape[2]
+        if new_num_pages <= 0:
+            return self
+
+        total_num_pages = old_num_pages + new_num_pages
+
+        # Create new extended buffer
+        new_shape = list(self._kv_buffer.shape)
+        new_shape[2] = total_num_pages
+        
+        new_buffer = torch.empty(
+            tuple(new_shape),
+            device=self._device,
+            dtype=self._kv_buffer.dtype,
+        )
+        
+        # Copy old data
+        new_buffer[:, :, :old_num_pages, :, :, :] = self._kv_buffer
+        
+        # Create new MHAKVCache instance
+        new_kvcache = MHAKVCache(
+            num_kv_heads=self._num_kv_heads,
+            num_layers=self._num_layers,
+            head_dim=self._head_dim,
+            num_pages=total_num_pages,
+            dtype=self._kv_buffer.dtype,
+            kv_layout=self._kv_layout,
+            device=self._device,
+        )
+
+        # Replace the buffer (created in __init__) with our extended one
+        new_kvcache._kv_buffer = new_buffer
+        new_kvcache._k_buffer = new_buffer[0]
+        new_kvcache._v_buffer = new_buffer[1]
+        new_kvcache._storage_shape = (
+            total_num_pages,
+            new_kvcache._storage_shape[1],
+            new_kvcache._storage_shape[2],
+        )
+        
+        return new_kvcache
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[index]

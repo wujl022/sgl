@@ -7,7 +7,7 @@ import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from minisgl.kvcache import create_kvcache
+from minisgl.kvcache import BaseKVCache, create_kvcache
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_hf_weight
 from minisgl.utils import divide_even, init_logger, torch_dtype
@@ -34,11 +34,18 @@ def _align_up_32(num: int) -> int:
 
 
 class Engine:
-    def __init__(self, config: EngineConfig):
+    def __init__(
+        self,
+        config: EngineConfig,
+        existing_kv_cache: BaseKVCache | None = None,
+        existing_page_table: torch.Tensor | None = None,
+        old_num_pages: int = 0,
+    ):
         self.model_config = config.model_config
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
 
-        assert not torch.cuda.is_initialized()
+        if existing_kv_cache is None:
+            assert not torch.cuda.is_initialized()
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
         self.stream = torch.cuda.Stream()
@@ -55,19 +62,49 @@ class Engine:
             self.model = create_model(config.model_path, config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
         self.model.process_weights_after_loading()
-        self.num_pages = self.dummy_page = self._determine_num_pages(init_free_memory, config)
-        self.kv_cache = create_kvcache(
-            model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
-            device=self.device,
-            dtype=self.dtype,
-        )
+        self.num_pages = self._determine_num_pages(init_free_memory, config)
+        
+        # Reuse and extend existing KV cache if provided
+        if existing_kv_cache is not None:
+            old_num_pages_with_dummy = existing_kv_cache._kv_buffer.shape[2]
+            old_num_pages_actual = old_num_pages_with_dummy - 1  # -1 for dummy page
+            new_num_pages_with_dummy = self.num_pages + 1  # +1 for dummy page
+            
+            if new_num_pages_with_dummy > 0:
+                logger.info_rank0(
+                    f"Extending KV cache from {old_num_pages_actual} to {old_num_pages_actual+self.num_pages} pages"
+                )
+                self.kv_cache = existing_kv_cache.extend(new_num_pages_with_dummy)
+            else:
+                self.kv_cache = existing_kv_cache
+                # Update num_pages to match existing cache
+                self.num_pages = old_num_pages_actual
+        else:
+            self.kv_cache = create_kvcache(
+                model_config=config.model_config,
+                num_pages=self.num_pages + 1,  # +1 for dummy page
+                device=self.device,
+                dtype=self.dtype,
+            )
+        
+        self.dummy_page = self.num_pages
+        
         # NOTE: make page table 128 aligned (32 * sizeof(int32) == 128 bytes)
         self.max_seq_len = _align_up_32(min(config.max_seq_len, self.num_pages))
-        self.page_table = create_page_table(  # + 1 for dummy request
-            (config.max_running_req + 1, self.max_seq_len),
-            device=self.device,
-        )
+        
+        # Reuse existing page table if provided (max_seq_len should not change)
+        if existing_page_table is not None:
+            if existing_page_table.shape[1] != self.max_seq_len:
+                raise ValueError(
+                    f"Existing page_table max_seq_len ({existing_page_table.shape[1]}) "
+                    f"does not match new max_seq_len ({self.max_seq_len})"
+                )
+            self.page_table = existing_page_table
+        else:
+            self.page_table = create_page_table(  # + 1 for dummy request
+                (config.max_running_req + 1, self.max_seq_len),
+                device=self.device,
+            )
         self.attn_backend = create_attention_backend(
             config.attention_backend,
             config.model_config,
@@ -91,6 +128,7 @@ class Engine:
             sampling_params=None,  # type: ignore
             cache_handle=None,  # type: ignore
         )
+        # Update dummy_page in page_table (important when extending)
         self.page_table[self.dummy_req.table_idx].fill_(self.dummy_page)
         self.graph_runner = GraphRunner(
             stream=self.stream,
@@ -106,6 +144,25 @@ class Engine:
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        if torch.distributed.is_initialized():
+            if (
+                torch.distributed.get_rank() != config.tp_info.rank
+                or torch.distributed.get_world_size() != config.tp_info.size
+            ):
+                raise RuntimeError(
+                    "torch.distributed 已初始化，但与当前 tp_info 不一致: "
+                    f"existing rank={torch.distributed.get_rank()}, world_size={torch.distributed.get_world_size()}; "
+                    f"new rank={config.tp_info.rank}, world_size={config.tp_info.size}"
+                )
+            tp_cpu_group = torch.distributed.group.WORLD
+            assert tp_cpu_group is not None
+            if config.tp_info.size != 1 and config.use_pynccl:
+                max_bytes = (
+                    config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
+                )
+                enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
+            return tp_cpu_group
+
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -163,10 +220,14 @@ class Engine:
 
             return out
 
-    def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+    def _determine_num_pages(
+        self,
+        old_free_memory: int,
+        config: EngineConfig,
+    ) -> int:
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
-            2  # key + value
+            2
             * self.model_config.head_dim
             * divide_even(self.model_config.num_kv_heads, config.tp_info.size)
             * config.page_size
@@ -176,7 +237,10 @@ class Engine:
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            total_memory = int(torch.cuda.get_device_properties(self.device).total_memory)
+            budget = int(config.memory_ratio * total_memory)
+            used_after_model = total_memory - new_free_memory
+            available_memory = max(0, budget - used_after_model)
             num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-tokens"

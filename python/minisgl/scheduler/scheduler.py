@@ -42,10 +42,26 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin):
-    def __init__(self, config: SchedulerConfig):
+    def __init__(
+        self,
+        config: SchedulerConfig,
+        existing_kv_cache=None,
+        existing_page_table=None,
+        existing_token_pool=None,
+        existing_cache_manager=None,
+        old_num_pages=0,
+        running_requests=None,
+        pending_requests=None,
+        finished_requests=None,
+    ):
         from minisgl.engine import Engine
 
-        self.engine = Engine(config)
+        self.engine = Engine(
+            config,
+            existing_kv_cache=existing_kv_cache,
+            existing_page_table=existing_page_table,
+            old_num_pages=old_num_pages,
+        )
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
@@ -57,7 +73,24 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-        self.cache_manager = CacheManager(self.device, self.engine.num_pages, config.cache_type)
+        
+        # Reuse existing token_pool if provided
+        if existing_token_pool is not None:
+            if existing_token_pool.shape != self.engine.page_table.shape:
+                raise ValueError(
+                    f"Existing token_pool shape {existing_token_pool.shape} "
+                    f"does not match page_table shape {self.engine.page_table.shape}"
+                )
+            self.table_manager.token_pool = existing_token_pool
+        
+        self.cache_manager = CacheManager(
+            self.device,
+            self.engine.num_pages,
+            config.cache_type,
+            existing_manager=existing_cache_manager.manager if existing_cache_manager else None,
+            old_num_pages=old_num_pages,
+        )
+        
         self.decode_manager = DecodeManager()
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
@@ -65,6 +98,15 @@ class Scheduler(SchedulerIOMixin):
 
         self.tp_info = config.tp_info
         self.finished_reqs: Set[Req] = set()
+        
+        # Restore request states if provided
+        if running_requests is not None:
+            self.decode_manager.running_reqs = running_requests
+        if pending_requests is not None:
+            self.prefill_manager.pending_list = pending_requests
+        if finished_requests is not None:
+            self.finished_reqs = finished_requests
+        
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.page_table = self.engine.page_table
@@ -216,12 +258,14 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool.view(-1)[input.write_indices] = output.next_tokens_gpu
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
-        self._load_token_ids(forward_input)
         batch, sample_args = forward_input.batch, forward_input.sample_args
         if ENV.OVERLAP_EXTRA_SYNC:  # NOTE: https://github.com/sgl-project/mini-sglang/issues/58
             self.stream.synchronize()
-        forward_output = self.engine.forward_batch(batch, sample_args)
-        self._write_token_ids(forward_input, forward_output)
+        with self.engine_stream_ctx:
+            self.engine.stream.wait_stream(self.stream)
+            self._load_token_ids(forward_input)
+            forward_output = self.engine.forward_batch(batch, sample_args)
+            self._write_token_ids(forward_input, forward_output)
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
