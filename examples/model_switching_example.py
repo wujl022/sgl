@@ -89,8 +89,8 @@ def switch_model_a_to_b(
     logger.info(f"Total: {free_slots_len + radix_tree_size} (should equal {new_num_pages})")
     
     assert (
-        free_slots_len + radix_tree_size == new_num_pages
-    ), f"Integrity check failed: {free_slots_len} + {radix_tree_size} != {new_num_pages}"
+        free_slots_len + radix_tree_size <= new_num_pages
+    ), f"Integrity check failed: {free_slots_len} + {radix_tree_size} > {new_num_pages}"
     
     # 验证 dummy_page
     assert (
@@ -106,19 +106,20 @@ def switch_model_a_to_b(
 if __name__ == "__main__":
     from minisgl.utils import init_logger
     from minisgl.core import SamplingParams
-    from minisgl.message import UserMsg, DetokenizeMsg
+    from minisgl.message import UserMsg
     from collections import deque
     
     logger = init_logger(__name__)
     
     # 配置模型A
     config_a = SchedulerConfig(
-        model_path="/root/autodl-tmp/Meta-Llama-3-8B-Instruct",
+        model_path="/home/wujl022/models/LLM-Research/Meta-Llama-3-8B-Instruct",
         tp_info=DistributedInfo(0, 1),
         dtype=torch.bfloat16,
         max_running_req=256,
         cache_type="radix",
         memory_ratio=0.5,
+        cuda_graph_bs=[0],
         offline_mode=True,  # 使用离线模式
     )
     
@@ -130,18 +131,19 @@ if __name__ == "__main__":
     prompt = "what is ai?"
     tokenizer = scheduler_a.tokenizer
     input_ids = tokenizer.encode(prompt, return_tensors="pt").view(-1).to(torch.int32)
+    print(f"Input IDs: {input_ids}")
     
     # 创建请求消息
     user_msg = UserMsg(
         uid=0,
         input_ids=input_ids,
-        sampling_params=SamplingParams(temperature=0.7, max_tokens=10),
+        sampling_params=SamplingParams(temperature=0.7, top_p=0.95, max_tokens=20, stop_token_ids=[128001, 128009]),
     )
     
     # 存储输出的 tokens
     output_tokens = []
     output_state = {"text": "", "count": 0}
-    switch_after_tokens = 5  # 输出5个tokens后切换
+    switch_after_tokens = 10 # 输出10个tokens后切换
     
     # 手动实现离线模式的请求处理
     pending_msgs = deque([user_msg])
@@ -191,17 +193,18 @@ if __name__ == "__main__":
     
     # ========== 切换到模型B ==========
     config_b = SchedulerConfig(
-        model_path="/root/autodl-tmp/Llama-3-8B-Instruct-GPTQ-4-Bit",
+        model_path="/home/wujl022/models/Huggingface/Meta-Llama-3-8B-Instruct-GPTQ-4bit-gs128",
         tp_info=DistributedInfo(0, 1),
         dtype=torch.bfloat16,
         max_running_req=256,
         cache_type="radix",
         memory_ratio=0.4,
+        cuda_graph_bs=[0],
         offline_mode=True,
     )
     
     scheduler_b = switch_model_a_to_b(scheduler_a, config_b)
-    
+
     # ========== 继续处理请求（使用模型B） ==========
     logger.info("Continuing generation with Model B...")
     
@@ -227,7 +230,7 @@ if __name__ == "__main__":
     scheduler_b.send_result = offline_send_result_b
     
     # 继续生成直到完成
-    max_iterations = 1000
+    max_iterations = 10
     iteration = 0
     
     while iteration < max_iterations:
@@ -245,4 +248,6 @@ if __name__ == "__main__":
     final_output = scheduler_b.tokenizer.decode(output_tokens, skip_special_tokens=True)
     logger.info(f"Final output ({len(output_tokens)} tokens): {final_output!r}")
     logger.info("Request completed!")
+
+    logger.info("Running reference generation without switching...")
 

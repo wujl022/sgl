@@ -75,6 +75,7 @@ class Engine:
                     f"Extending KV cache from {old_num_pages_actual} to {old_num_pages_actual+self.num_pages} pages"
                 )
                 self.kv_cache = existing_kv_cache.extend(new_num_pages_with_dummy)
+                self.num_pages = self.num_pages + old_num_pages_actual
             else:
                 self.kv_cache = existing_kv_cache
                 # Update num_pages to match existing cache
@@ -272,10 +273,10 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
-            else:
-                logits = self.model.forward()
+            # if self.graph_runner.can_use_cuda_graph(batch):
+            #     logits = self.graph_runner.replay(batch)
+            # else:
+            logits = self.model.forward()
 
         for req in batch.reqs:
             req.complete_one()

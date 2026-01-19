@@ -16,27 +16,26 @@ class CacheManager:
         num_pages: int,
         type: str,
         existing_manager: BaseCacheManager | None = None,
+        existing_free_slots: torch.Tensor | None = None,
         old_num_pages: int = 0,
     ):
-        # TODO: support page_size > 1
         self.device = device
         self.num_pages = num_pages
-        
-        # Reuse existing Radix Tree if provided
+
         if existing_manager is not None:
             self.manager = existing_manager
-            # Update free_slots: add new pages (from old_num_pages to num_pages)
-            # Note: Old pages [0, old_num_pages) are already in the Radix Tree
-            # New pages [old_num_pages, num_pages) are free and available
+            base_free_slots = (
+                existing_free_slots.to(device, non_blocking=True)
+                if existing_free_slots is not None
+                else torch.empty(0, dtype=torch.int32, device=device)
+            )
             if num_pages > old_num_pages:
-                new_pages = torch.arange(
-                    old_num_pages, num_pages, dtype=torch.int32, device=device
+                new_pages = torch.arange(old_num_pages, num_pages, dtype=torch.int32, device=device)
+                self._free_slots = (
+                    torch.cat([base_free_slots, new_pages]) if len(base_free_slots) > 0 else new_pages
                 )
-                self._free_slots = new_pages
             else:
-                # If new num_pages <= old_num_pages, all new pages are already in use
-                # This shouldn't happen in normal usage, but handle it gracefully
-                self._free_slots = torch.empty(0, dtype=torch.int32, device=device)
+                self._free_slots = base_free_slots
         else:
             self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device)
             self.manager = create_cache_manager(device=device, type=type)

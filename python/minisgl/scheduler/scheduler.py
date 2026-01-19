@@ -88,6 +88,7 @@ class Scheduler(SchedulerIOMixin):
             self.engine.num_pages,
             config.cache_type,
             existing_manager=existing_cache_manager.manager if existing_cache_manager else None,
+            existing_free_slots=existing_cache_manager._free_slots if existing_cache_manager else None,
             old_num_pages=old_num_pages,
         )
         

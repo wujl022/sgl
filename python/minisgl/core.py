@@ -18,6 +18,7 @@ class SamplingParams:
     top_p: float = 1.0
     ignore_eos: bool = False
     max_tokens: int = 1024
+    stop_token_ids: Optional[List[int]] = None
 
     @property
     def is_greedy(self) -> bool:
