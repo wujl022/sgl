@@ -64,26 +64,36 @@ class Engine:
         self.model.process_weights_after_loading()
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         
-        # Reuse and extend existing KV cache if provided
         if existing_kv_cache is not None:
-            old_num_pages_with_dummy = existing_kv_cache._kv_buffer.shape[2]
-            old_num_pages_actual = old_num_pages_with_dummy - 1  # -1 for dummy page
-            new_num_pages_with_dummy = self.num_pages + 1  # +1 for dummy page
-            
-            if new_num_pages_with_dummy > 0:
+            old_num_pages_actual = existing_kv_cache.num_pages
+            add_pages = self.num_pages
+            if add_pages > 0:
                 logger.info_rank0(
-                    f"Extending KV cache from {old_num_pages_actual} to {old_num_pages_actual+self.num_pages} pages"
+                    f"Extending KV cache from {old_num_pages_actual} to {old_num_pages_actual + add_pages} pages"
                 )
-                self.kv_cache = existing_kv_cache.extend(new_num_pages_with_dummy)
-                self.num_pages = self.num_pages + old_num_pages_actual
+                new_segment = create_kvcache(
+                    model_config=config.model_config,
+                    num_pages=add_pages + 1,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                from minisgl.kvcache.mha_pool import SegmentedMHAKVCache
+
+                if isinstance(existing_kv_cache, SegmentedMHAKVCache):
+                    self.kv_cache = SegmentedMHAKVCache(
+                        existing_kv_cache.segments() + [new_segment]
+                    )
+                else:
+                    self.kv_cache = SegmentedMHAKVCache([existing_kv_cache, new_segment])
+
+                self.num_pages = old_num_pages_actual + add_pages
             else:
                 self.kv_cache = existing_kv_cache
-                # Update num_pages to match existing cache
                 self.num_pages = old_num_pages_actual
         else:
             self.kv_cache = create_kvcache(
                 model_config=config.model_config,
-                num_pages=self.num_pages + 1,  # +1 for dummy page
+                num_pages=self.num_pages + 1,
                 device=self.device,
                 dtype=self.dtype,
             )
@@ -273,10 +283,10 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
-            # if self.graph_runner.can_use_cuda_graph(batch):
-            #     logits = self.graph_runner.replay(batch)
-            # else:
-            logits = self.model.forward()
+            if self.graph_runner.can_use_cuda_graph(batch):
+                logits = self.graph_runner.replay(batch)
+            else:
+                logits = self.model.forward()
 
         for req in batch.reqs:
             req.complete_one()

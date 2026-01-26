@@ -27,6 +27,14 @@ class BaseKVCache(ABC):
 
     @property
     @abstractmethod
+    def num_pages_with_dummy(self) -> int: ...
+
+    @property
+    def num_pages(self) -> int:
+        return self.num_pages_with_dummy - 1
+
+    @property
+    @abstractmethod
     def device(self) -> torch.device: ...
 
     @property

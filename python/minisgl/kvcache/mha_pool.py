@@ -125,5 +125,80 @@ class MHAKVCache(BaseKVCache):
         return self._kv_buffer.dtype
 
     @property
+    def num_pages_with_dummy(self) -> int:
+        return self._kv_buffer.shape[2]
+
+    @property
+    def num_layers(self) -> int:
+        return self._num_layers
+
+
+class SegmentedMHAKVCache(BaseKVCache):
+    def __init__(self, segments: list[MHAKVCache]):
+        if len(segments) == 0:
+            raise ValueError("segments must not be empty")
+        base = segments[0]
+        for seg in segments[1:]:
+            if seg.device != base.device:
+                raise ValueError("All segments must be on the same device")
+            if seg.dtype != base.dtype:
+                raise ValueError("All segments must have the same dtype")
+            if seg.num_layers != base.num_layers:
+                raise ValueError("All segments must have the same num_layers")
+
+        self._segments = segments
+        self._device = base.device
+        self._dtype = base.dtype
+        self._num_layers = base.num_layers
+
+        starts: list[int] = []
+        ends: list[int] = []
+        cur = 0
+        for i, seg in enumerate(segments):
+            starts.append(cur)
+            seg_total = seg.num_pages_with_dummy
+            cur += seg_total if i == len(segments) - 1 else (seg_total - 1)
+            ends.append(cur)
+        self._segment_starts = starts
+        self._segment_ends = ends
+
+    def segments(self) -> list[MHAKVCache]:
+        return self._segments
+
+    @property
+    def segment_starts(self) -> list[int]:
+        return self._segment_starts
+
+    @property
+    def segment_ends(self) -> list[int]:
+        return self._segment_ends
+
+    def k_cache(self, index: int) -> torch.Tensor:
+        raise RuntimeError("SegmentedMHAKVCache does not provide a unified k_cache")
+
+    def v_cache(self, index: int) -> torch.Tensor:
+        raise RuntimeError("SegmentedMHAKVCache does not provide a unified v_cache")
+
+    def store_kv(
+        self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
+    ) -> None:
+        for start, end, seg in zip(self._segment_starts, self._segment_ends, self._segments):
+            mask = (out_loc >= start) & (out_loc < end)
+            if torch.any(mask):
+                seg.store_kv(k[mask], v[mask], out_loc[mask] - start, layer_id)
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    @property
+    def num_pages_with_dummy(self) -> int:
+        return self._segment_ends[-1]
+
+    @property
     def num_layers(self) -> int:
         return self._num_layers

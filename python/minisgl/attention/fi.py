@@ -183,8 +183,90 @@ class FlashInferBackend(BaseAttnBackend):
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
-        self._initialize_metadata_once(metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+
+        if hasattr(self.kvcache, "segments"):
+            from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+            from flashinfer.cascade import merge_states
+
+            bs = len(batch.padded_reqs)
+            indices = metadata.indices
+            cu_k = metadata.cu_seqlens_k_cpu
+            outputs: List[torch.Tensor] = []
+            lses: List[torch.Tensor] = []
+            wrapper = metadata.wrapper
+
+            for start, end, seg in zip(
+                self.kvcache.segment_starts, self.kvcache.segment_ends, self.kvcache.segments()
+            ):
+                mask = (indices >= start) & (indices < end)
+                if not torch.any(mask):
+                    continue
+
+                local_indices = indices[mask] - start
+                mcpu = mask.cpu()
+                counts: List[int] = []
+                for i in range(bs):
+                    s = int(cu_k[i].item())
+                    e = int(cu_k[i + 1].item())
+                    counts.append(int(mcpu[s:e].sum().item()))
+
+                cu_k_seg = torch.tensor(
+                    [0] + counts, device="cpu", dtype=torch.int32, pin_memory=True
+                ).cumsum_(dim=0)
+                seq_lens_seg = torch.tensor(
+                    counts, device="cpu", dtype=torch.int32, pin_memory=True
+                )
+                last_page_len_seg = self._get_ones_cpu(bs)
+
+                if isinstance(wrapper, BatchDecodeWithPagedKVCacheWrapper):
+                    wrapper.plan(
+                        indptr=cu_k_seg,
+                        indices=local_indices,
+                        last_page_len=last_page_len_seg,
+                        num_qo_heads=metadata.num_qo_heads,
+                        num_kv_heads=metadata.num_kv_heads,
+                        head_dim=metadata.head_dim,
+                        page_size=metadata.page_size,
+                        pos_encoding_mode=metadata.pos_encoding_mode,
+                        seq_lens=seq_lens_seg,
+                        data_type=metadata.dtype,
+                        q_data_type=metadata.dtype,
+                        kv_data_type=metadata.dtype,
+                        non_blocking=True,
+                    )
+                else:
+                    wrapper.plan(
+                        qo_indptr=metadata.cu_seqlens_q_cpu,
+                        paged_kv_indptr=cu_k_seg,
+                        paged_kv_indices=local_indices,
+                        paged_kv_last_page_len=last_page_len_seg,
+                        num_qo_heads=metadata.num_qo_heads,
+                        num_kv_heads=metadata.num_kv_heads,
+                        head_dim_qk=metadata.head_dim,
+                        page_size=metadata.page_size,
+                        pos_encoding_mode=metadata.pos_encoding_mode,
+                        seq_lens=seq_lens_seg,
+                        q_data_type=metadata.dtype,
+                        kv_data_type=metadata.dtype,
+                        non_blocking=True,
+                        causal=True,
+                    )
+
+                kv_cache_seg = (seg.k_cache(layer_id), seg.v_cache(layer_id))
+                o, lse = wrapper.run(q=q, paged_kv_cache=kv_cache_seg, return_lse=True)
+                outputs.append(o)
+                lses.append(lse)
+
+            if len(outputs) == 1:
+                return outputs[0]
+
+            v_states = torch.stack(outputs, dim=1)
+            s_states = torch.stack([x.to(torch.float32) for x in lses], dim=1)
+            merged, _ = merge_states(v_states, s_states)
+            return merged
+
+        self._initialize_metadata_once(metadata)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
