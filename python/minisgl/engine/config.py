@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -56,4 +57,9 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:23333"
+        dist_addr = os.environ.get("MINISGL_DIST_ADDR")
+        if dist_addr:
+            return dist_addr
+        host = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        port = os.environ.get("MASTER_PORT", os.environ.get("MINISGL_DIST_PORT", "23333"))
+        return f"tcp://{host}:{port}"

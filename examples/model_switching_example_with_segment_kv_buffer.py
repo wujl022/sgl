@@ -8,8 +8,11 @@
 - 因为模型B权重更少，num_pages 变多，扩展 kv_buffer 和 _free_slots
 """
 
+import gc
+import json
 import os
 import time
+from dataclasses import replace
 
 import torch
 from minisgl.scheduler import Scheduler, SchedulerConfig
@@ -53,6 +56,27 @@ def switch_model_a_to_b(
     old_num_pages = scheduler_a.engine.num_pages
     
     logger.info(f"Saved resources: old_num_pages={old_num_pages}")
+
+    kv_cache_id = id(existing_kv_cache)
+    page_table_ptr = int(existing_page_table.data_ptr())
+    token_pool_ptr = int(existing_token_pool.data_ptr())
+    cache_mgr_id = id(existing_cache_manager.manager)
+
+    k0_ptr = None
+    v0_ptr = None
+    if hasattr(existing_kv_cache, "k_cache") and hasattr(existing_kv_cache, "v_cache"):
+        try:
+            k0_ptr = int(existing_kv_cache.k_cache(0).data_ptr())
+            v0_ptr = int(existing_kv_cache.v_cache(0).data_ptr())
+        except Exception:
+            k0_ptr = None
+            v0_ptr = None
+
+    logger.info(
+        "Reuse baseline: "
+        f"kv_cache_id={kv_cache_id} page_table_ptr={page_table_ptr} token_pool_ptr={token_pool_ptr} "
+        f"cache_mgr_id={cache_mgr_id} k0_ptr={k0_ptr} v0_ptr={v0_ptr}"
+    )
     
     # ========== 步骤 4: 卸载模型A ==========
     # 先 destroy CUDA graphs
@@ -68,6 +92,8 @@ def switch_model_a_to_b(
     # ========== 步骤 5: 加载模型B ==========
     # 模型B会在 Scheduler 初始化时自动加载
     
+    config_b = replace(config_b, num_page_override=old_num_pages)
+
     # ========== 步骤 6-11: 创建模型B的调度器（自动处理扩展和恢复） ==========
     scheduler_b = Scheduler(
         config_b,
@@ -80,6 +106,29 @@ def switch_model_a_to_b(
         pending_requests=pending_requests,
         finished_requests=finished_requests,
     )
+
+    logger.info(
+        "Reuse checks: "
+        f"kv_cache_is_same={scheduler_b.engine.kv_cache is existing_kv_cache} "
+        f"page_table_is_same={scheduler_b.engine.page_table is existing_page_table} "
+        f"token_pool_is_same={scheduler_b.token_pool is existing_token_pool} "
+        f"cache_mgr_is_same={scheduler_b.cache_manager.manager is existing_cache_manager.manager}"
+    )
+
+    assert scheduler_b.engine.kv_cache is existing_kv_cache
+    assert scheduler_b.engine.page_table is existing_page_table
+    assert scheduler_b.token_pool is existing_token_pool
+    assert scheduler_b.cache_manager.manager is existing_cache_manager.manager
+
+    assert int(scheduler_b.engine.page_table.data_ptr()) == page_table_ptr
+    assert int(scheduler_b.token_pool.data_ptr()) == token_pool_ptr
+
+    if k0_ptr is not None and hasattr(scheduler_b.engine.kv_cache, "k_cache") and hasattr(scheduler_b.engine.kv_cache, "v_cache"):
+        k0_ptr_b = int(scheduler_b.engine.kv_cache.k_cache(0).data_ptr())
+        v0_ptr_b = int(scheduler_b.engine.kv_cache.v_cache(0).data_ptr())
+        logger.info(f"KV ptr check: k0_ptr(before={k0_ptr}, after={k0_ptr_b}) v0_ptr(before={v0_ptr}, after={v0_ptr_b})")
+        assert k0_ptr_b == k0_ptr
+        assert v0_ptr_b == v0_ptr
     
     # ========== 步骤 12: 验证完整性 ==========
     new_num_pages = scheduler_b.engine.num_pages
@@ -104,421 +153,426 @@ def switch_model_a_to_b(
     
     return scheduler_b
 
+def reset_scheduler_state(scheduler: Scheduler) -> None:
+    torch.cuda.synchronize(scheduler.engine.device)
+    scheduler.prefill_manager.pending_list.clear()
+    scheduler.decode_manager.running_reqs.clear()
+    scheduler.finished_reqs.clear()
+    scheduler.table_manager._free_slots = list(range(scheduler.table_manager._max_running_reqs))
+    scheduler.cache_manager.manager.reset()
+    scheduler.cache_manager._free_slots = torch.arange(
+        scheduler.engine.num_pages, dtype=torch.int32, device=scheduler.engine.device
+    )
+    scheduler.page_table.fill_(scheduler.engine.dummy_page)
+    scheduler.token_pool.zero_()
 
-# ========== 使用示例 ==========
-if __name__ == "__main__":
-    from minisgl.utils import init_logger
+def normal_loop_no_throw(scheduler: Scheduler) -> None:
+    try:
+        scheduler.normal_loop()
+    except Exception as e:
+        if "RequestAllFinished" in str(type(e).__name__):
+            return
+        raise
+
+def run_opencompass_json() -> None:
+    from collections import deque
+
     from minisgl.core import SamplingParams
     from minisgl.message import UserMsg
-    from collections import deque
-    
+    from minisgl.utils import init_logger
+
     logger = init_logger(__name__)
 
-    if os.environ.get("MINISGL_MODE", "bench") == "bench":
-        from collections import deque
-        from random import randint, seed
+    json_in = os.environ.get(
+        "MINISGL_OC_JSON_IN",
+        "/home/wujl022/opencompass/outputs/llama3-8b-instruct-gptq4bit/20260126_151217/predictions/llama3-8b-instruct-gptq4bit-hf/gsm8k.json",
+    )
+    json_out = os.environ.get("MINISGL_OC_JSON_OUT", "").strip() or json_in
 
-        from minisgl.core import SamplingParams
-        from minisgl.message import UserMsg
+    attn = os.environ.get("MINISGL_ATTENTION_BACKEND", "fi")
+    cache_type = os.environ.get("MINISGL_CACHE_TYPE", "naive")
+    bs = int(os.environ.get("MINISGL_BATCH_SIZE", os.environ.get("MINISGL_BS", "70")))
+    max_tokens = int(os.environ.get("MINISGL_MAX_TOKENS", os.environ.get("MINISGL_OUTPUT_LEN", "650")))
+    split_after_env = int(os.environ.get("MINISGL_SPLIT_AFTER", "138"))
+    split_after = (max_tokens // 2) if split_after_env < 0 else split_after_env
 
-        seed(int(os.environ.get("MINISGL_SEED", "0")))
-        attn = os.environ.get("MINISGL_ATTENTION_BACKEND", "fi")
-        cache_type = os.environ.get("MINISGL_CACHE_TYPE", "naive")
-        bs = int(os.environ.get("MINISGL_BS", "64"))
-        input_len = int(os.environ.get("MINISGL_INPUT_LEN", "128"))
-        output_len = int(os.environ.get("MINISGL_OUTPUT_LEN", "1024"))
-        split_after = int(os.environ.get("MINISGL_SPLIT_AFTER", "512"))
-        verify_uid = int(os.environ.get("MINISGL_VERIFY_UID", "0"))
+    one_batch = os.environ.get("MINISGL_ONE_BATCH", "0").strip() == "1"
+    batch_idx = int(os.environ.get("MINISGL_BATCH_IDX", "0"))
+    max_seq_len = int(os.environ.get("MINISGL_MAX_SEQ_LEN", "2200"))
+    temperature = float(os.environ.get("MINISGL_TEMPERATURE", "0.7"))
+    top_p = float(os.environ.get("MINISGL_TOP_P", "0.95"))
 
-        if split_after <= 0 or split_after >= output_len:
-            raise ValueError(f"Invalid split_after={split_after}, expected 0 < split_after < output_len")
+    model_a_path = os.environ.get(
+        "MINISGL_MODEL_A_PATH",
+        "/home/wujl022/models/LLM-Research/Meta-Llama-3-8B-Instruct",
+    )
+    model_b_path = os.environ.get(
+        "MINISGL_MODEL_B_PATH",
+        "/home/wujl022/models/Huggingface/Meta-Llama-3-8B-Instruct-GPTQ-4bit-gs128",
+    )
 
-        config_a = SchedulerConfig(
-            model_path="/home/wujl022/models/LLM-Research/Meta-Llama-3-8B-Instruct",
-            tp_info=DistributedInfo(0, 1),
-            dtype=torch.bfloat16,
-            attention_backend=attn,
-            max_running_req=max(256, bs),
-            cache_type=cache_type,
-            memory_ratio=0.9,
-            cuda_graph_bs=[0],
-            offline_mode=True,
+    if split_after <= 0 or split_after >= max_tokens:
+        raise ValueError(
+            f"Invalid MINISGL_SPLIT_AFTER={split_after}, expected 0 < split_after < max_tokens={max_tokens}"
         )
-        scheduler_a = Scheduler(config_a)
 
-        config_b = SchedulerConfig(
-            model_path="/home/wujl022/models/Huggingface/Meta-Llama-3-8B-Instruct-GPTQ-4bit-gs128",
-            tp_info=DistributedInfo(0, 1),
-            dtype=torch.bfloat16,
-            attention_backend=attn,
-            max_running_req=max(256, bs),
-            cache_type=cache_type,
-            memory_ratio=0.9,
-            cuda_graph_bs=[0],
-            offline_mode=True,
-        )
-        scheduler_b = switch_model_a_to_b(scheduler_a, config_b)
+    with open(json_in, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-        kv_cache = scheduler_b.engine.kv_cache
-        if not hasattr(kv_cache, "segments"):
-            raise RuntimeError("KV cache is not segmented after switching")
-        seg2_start = int(kv_cache.segment_starts[1])
+    def _key_to_int(k: str) -> int:
+        try:
+            return int(k)
+        except Exception:
+            return 10**18
 
-        prompt_token_ids = [[randint(0, 10000) for _ in range(input_len)] for _ in range(bs)]
-        uids = list(range(0, bs))
+    items = sorted(data.items(), key=lambda kv: _key_to_int(kv[0]))
+    prompts: list[str] = []
+    keys: list[str] = []
+    for k, v in items:
+        keys.append(k)
+        if isinstance(v, dict) and "origin_prompt" in v:
+            prompts.append(str(v["origin_prompt"]))
+        else:
+            raise KeyError(f"Missing origin_prompt for key={k} in {json_in}")
 
-        def reorder(mode: str) -> None:
-            free = scheduler_b.cache_manager._free_slots
-            mask = free >= seg2_start if mode == "seg2" else free < seg2_start
-            scheduler_b.cache_manager._free_slots = torch.cat([free[mask], free[~mask]])
+    config_a = SchedulerConfig(
+        model_path=model_a_path,
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        attention_backend=attn,
+        max_running_req=bs,
+        cache_type=cache_type,
+        memory_ratio=0.9,
+        cuda_graph_bs=[0],
+        offline_mode=True,
+        max_seq_len_override=max_seq_len,
+    )
 
-        def reset_state() -> None:
+    config_b = SchedulerConfig(
+        model_path=model_b_path,
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        attention_backend=attn,
+        max_running_req=bs,
+        cache_type=cache_type,
+        memory_ratio=0.9,
+        cuda_graph_bs=[0],
+        offline_mode=True,
+        max_seq_len_override=max_seq_len,
+    )
+
+    scheduler_b = None
+    cur_model = "a"
+
+    def hard_cleanup_scheduler() -> None:
+        nonlocal scheduler_b, cur_model
+        if scheduler_b is None:
+            return
+
+        import minisgl.core as _mcore
+
+        try:
             torch.cuda.synchronize(scheduler_b.engine.device)
-            scheduler_b.prefill_manager.pending_list.clear()
-            scheduler_b.decode_manager.running_reqs.clear()
-            scheduler_b.finished_reqs.clear()
-            scheduler_b.table_manager._free_slots = list(range(scheduler_b.table_manager._max_running_reqs))
-            scheduler_b.cache_manager.manager.reset()
-            scheduler_b.cache_manager._free_slots = torch.arange(
-                scheduler_b.engine.num_pages, dtype=torch.int32, device=scheduler_b.engine.device
-            )
-            scheduler_b.page_table.fill_(scheduler_b.engine.dummy_page)
-            scheduler_b.token_pool.zero_()
+        except Exception:
+            pass
 
-        def _normal_loop() -> None:
+        try:
+            scheduler_b.shutdown()
+        except Exception:
             try:
-                scheduler_b.normal_loop()
-            except Exception as e:
-                if "RequestAllFinished" in str(type(e).__name__):
-                    return
-                raise
+                scheduler_b.engine.graph_runner.destroy_cuda_graphs()
+            except Exception:
+                pass
 
-        def run_case(
-            name: str,
-            *,
-            flip_to_seg2: bool,
-            output_len_override: int | None = None,
-            split_after_override: int | None = None,
-            measure: bool = True,
-        ) -> None:
-            prompt_len = input_len
-            local_output_len = output_len if output_len_override is None else int(output_len_override)
-            local_split_after = split_after if split_after_override is None else int(split_after_override)
+        tmp = scheduler_b
+        scheduler_b = None
+        cur_model = "a"
+        del tmp
 
-            pending_msgs = deque(
-                [
-                    UserMsg(
-                        uid=uid,
-                        input_ids=torch.tensor(prompt_token_ids[i], dtype=torch.int32),
-                        sampling_params=SamplingParams(
-                            ignore_eos=True,
-                            max_tokens=local_output_len,
-                            temperature=0.7,
-                            top_p=0.95,
-                            stop_token_ids=[128001, 128009],
-                        ),
-                    )
-                    for i, uid in enumerate(uids)
-                ]
-            )
+        _mcore._GLOBAL_CTX = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        if hasattr(torch._C, "_cuda_clearCublasWorkspaces"):
+            torch._C._cuda_clearCublasWorkspaces()
 
-            counts = {uid: 0 for uid in uids}
-            table_idx0 = None
+    def run_one_batch(batch_prompts: list[str]) -> list[str]:
+        nonlocal scheduler_b, cur_model
 
-            def min_cached_out() -> int:
-                vals = [
-                    int(r.cached_len) - prompt_len
-                    for r in scheduler_b.decode_manager.running_reqs
-                    if r.uid in counts
-                ]
-                return min(vals) if vals else -1
+        uids = list(range(len(batch_prompts)))
+        pending_msgs = deque(
+            [
+                UserMsg(
+                    uid=uid,
+                    input_ids=scheduler_b.tokenizer.encode(p, return_tensors="pt").view(-1).to(torch.int32),
+                    sampling_params=SamplingParams(
+                        ignore_eos=False,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                    ),
+                )
+                for uid, p in zip(uids, batch_prompts)
+            ]
+        )
 
-            def recv(blocking: bool = False):
-                _ = blocking
-                if not pending_msgs:
-                    return []
-                msgs = list(pending_msgs)
-                pending_msgs.clear()
-                return msgs
+        counts = {uid: 0 for uid in uids}
+        finished = {uid: False for uid in uids}
+        out_ids = {uid: [] for uid in uids}
 
-            def send(reply):
-                for m in reply:
-                    if m.uid in counts:
-                        counts[m.uid] += 1
+        def recv(blocking: bool = False):
+            _ = blocking
+            if not pending_msgs:
+                return []
+            msgs = list(pending_msgs)
+            pending_msgs.clear()
+            return msgs
 
+        def send(reply):
+            eos_id = int(scheduler_b.eos_token_id)
+            for m in reply:
+                if m.uid not in counts:
+                    continue
+                if not (m.finished and int(m.next_token) == eos_id):
+                    counts[m.uid] += 1
+                    out_ids[m.uid].append(int(m.next_token))
+                if m.finished:
+                    finished[m.uid] = True
+
+        scheduler_b.receive_msg = recv
+        scheduler_b.send_result = send
+
+        it = 0
+        while (
+            any((not finished[uid]) and counts[uid] < split_after for uid in uids)
+            and it < 200000
+        ):
+            it += 1
+            normal_loop_no_throw(scheduler_b)
+
+        if any(not finished[uid] for uid in uids):
+            scheduler_b = switch_model_a_to_b(scheduler_b, config_b)
+            cur_model = "b"
             scheduler_b.receive_msg = recv
             scheduler_b.send_result = send
 
-            reorder("seg1")
-            it = 0
-            while min_cached_out() < local_split_after and it < 200000:
-                it += 1
-                _normal_loop()
-                if table_idx0 is None:
-                    r0 = next(
-                        (r for r in scheduler_b.decode_manager.running_reqs if r.uid == verify_uid),
-                        None,
-                    )
-                    if r0 is not None:
-                        table_idx0 = int(r0.table_idx)
+        while any(not finished[uid] for uid in uids) and it < 400000:
+            it += 1
+            normal_loop_no_throw(scheduler_b)
 
-            if flip_to_seg2:
-                reorder("seg2")
+        if any(not finished[uid] for uid in uids):
+            unfinished = {uid: counts[uid] for uid in uids if not finished[uid]}
+            raise RuntimeError(f"generation did not finish: unfinished={unfinished}")
 
-            t0 = None
-            if measure:
-                torch.cuda.synchronize(scheduler_b.engine.device)
-                t0 = time.perf_counter()
+        return [scheduler_b.tokenizer.decode(out_ids[uid]) for uid in uids]
 
-            while min(counts.values()) < local_output_len and it < 400000:
-                it += 1
-                _normal_loop()
+    if one_batch:
+        starts = [batch_idx * bs]
+    else:
+        starts = list(range(0, len(prompts), bs))
 
-            if measure:
-                torch.cuda.synchronize(scheduler_b.engine.device)
-                t1 = time.perf_counter()
+    for start in starts:
+        if start < 0 or start >= len(prompts):
+            raise SystemExit(0)
 
-            if min(counts.values()) < local_output_len:
-                raise RuntimeError(
-                    f"{name}: generation did not finish: min_count={min(counts.values())}"
-                )
-
-            if table_idx0 is not None:
-                kv_pages = scheduler_b.page_table[
-                    table_idx0, prompt_len : prompt_len + local_output_len - 1
-                ].to("cpu")
-                first = kv_pages[:local_split_after]
-                last = kv_pages[local_split_after:]
-                if flip_to_seg2:
-                    assert torch.all(first < seg2_start)
-                    assert torch.all(last >= seg2_start)
-                else:
-                    assert torch.all(kv_pages < seg2_start)
-
-            if measure:
-                assert t0 is not None
-                elapsed_s = t1 - t0
-                timed_tokens = bs * (local_output_len - local_split_after - 1)
-                tok_s = timed_tokens / elapsed_s
-                logger.info(
-                    f"{name}: bs={bs} input_len={input_len} output_len={local_output_len} split_after={local_split_after} "
-                    f"time_last={elapsed_s:.3f}s throughput_last={tok_s:.2f} tok/s"
-                )
-
-        reset_state()
-        warmup_output_len = min(output_len, int(os.environ.get("MINISGL_WARMUP_OUTPUT_LEN", "128")))
-        warmup_split_after = min(split_after, warmup_output_len // 2)
-        run_case(
-            "warmup_seg1_then_seg2",
-            flip_to_seg2=True,
-            output_len_override=warmup_output_len,
-            split_after_override=warmup_split_after,
-            measure=False,
-        )
-
-        reset_state()
-        run_case("all_in_seg1", flip_to_seg2=False)
-
-        reset_state()
-        run_case("seg1_then_seg2", flip_to_seg2=True)
-        raise SystemExit(0)
-
-    # 配置模型A
-    config_a = SchedulerConfig(
-        model_path="/home/wujl022/models/LLM-Research/Meta-Llama-3-8B-Instruct",
-        tp_info=DistributedInfo(0, 1),
-        dtype=torch.bfloat16,
-        attention_backend="fi",
-        max_running_req=256,
-        cache_type="radix",
-        memory_ratio=0.9,
-        cuda_graph_bs=[0],
-        offline_mode=True,  # 使用离线模式
-    )
-    
-    # 部署模型A
-    scheduler_a = Scheduler(config_a)
-    logger.info("Model A deployed")
-    
-    # ========== 发送请求 "what is ai?" ==========
-    prompt = "what is ai?"
-    tokenizer = scheduler_a.tokenizer
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").view(-1).to(torch.int32)
-    print(f"Input IDs: {input_ids}")
-    
-    # 创建请求消息
-    user_msg = UserMsg(
-        uid=0,
-        input_ids=input_ids,
-        sampling_params=SamplingParams(temperature=0.7, top_p=0.95, ignore_eos=True, max_tokens=21, stop_token_ids=[128001, 128009]),
-    )
-    
-    # 存储输出的 tokens
-    output_tokens = []
-    output_state = {"text": "", "count": 0}
-    switch_after_tokens = 11 # 输出11个tokens后切换（保证前10个输出token的KV都已经写入段1）
-    
-    # 手动实现离线模式的请求处理
-    pending_msgs = deque([user_msg])
-    
-    def offline_receive_msg(blocking=False):
-        if pending_msgs:
-            return [pending_msgs.popleft()]
-        return []
-    
-    def offline_send_result(reply):
-        for msg in reply:
-            if msg.uid == 0:  # 我们的请求
-                token = msg.next_token
-                output_tokens.append(token)
-                output_state["count"] += 1
-                # 解码 token 到文本
-                token_text = tokenizer.decode([token], skip_special_tokens=True)
-                output_state["text"] += token_text
-                logger.info(
-                    f"Model A - Token {output_state['count']}: {token_text!r} "
-                    f"(total: {output_state['text']!r})"
-                )
-    
-    # 替换 scheduler 的 I/O 方法
-    scheduler_a.receive_msg = offline_receive_msg
-    scheduler_a.send_result = offline_send_result
-    
-    logger.info(f"Processing request: {prompt!r}")
-    logger.info("Starting generation with Model A...")
-    
-    # 运行 scheduler 直到输出指定数量的 tokens
-    max_iterations = 200
-    iteration = 0
-    
-    while output_state["count"] < switch_after_tokens and iteration < max_iterations:
-        iteration += 1
+        scheduler_b = Scheduler(config_a)
+        cur_model = "a"
         try:
-            # 运行一个调度循环
-            scheduler_a.normal_loop()
-        except Exception as e:
-            if "RequestAllFinished" in str(type(e).__name__):
-                break
-            raise
-    
-    logger.info(f"Model A generated {output_state['count']} tokens: {output_state['text']!r}")
-    logger.info("Switching to Model B...")
-    
-    # ========== 切换到模型B ==========
-    config_b = SchedulerConfig(
-        model_path="/home/wujl022/models/Huggingface/Meta-Llama-3-8B-Instruct-GPTQ-4bit-gs128",
+            reset_scheduler_state(scheduler_b)
+            batch_prompts = prompts[start : start + bs]
+            batch_keys = keys[start : start + bs]
+            batch_out = run_one_batch(batch_prompts)
+            for k, pred in zip(batch_keys, batch_out):
+                data[k]["prediction"] = pred
+        finally:
+            hard_cleanup_scheduler()
+
+        processed = min(start + bs, len(prompts))
+        logger.info(f"processed {processed}/{len(prompts)}")
+
+        if one_batch:
+            with open(json_out, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            logger.info(f"updated predictions (one batch): {json_out}")
+            raise SystemExit(0)
+
+    with open(json_out, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+    logger.info(f"updated predictions: {json_out}")
+
+def run_bench() -> None:
+    from collections import deque
+    from random import randint, seed
+
+    from minisgl.core import SamplingParams
+    from minisgl.message import UserMsg
+    from minisgl.utils import init_logger
+
+    logger = init_logger(__name__)
+
+    seed(int(os.environ.get("MINISGL_SEED", "0")))
+    attn = os.environ.get("MINISGL_ATTENTION_BACKEND", "fi")
+    cache_type = os.environ.get("MINISGL_CACHE_TYPE", "naive")
+    bs = int(os.environ.get("MINISGL_BS", "64"))
+    input_len = int(os.environ.get("MINISGL_INPUT_LEN", "128"))
+    output_len = int(os.environ.get("MINISGL_OUTPUT_LEN", "1024"))
+    split_after = int(os.environ.get("MINISGL_SPLIT_AFTER", "512"))
+    verify_uid = int(os.environ.get("MINISGL_VERIFY_UID", "0"))
+
+    if split_after <= 0 or split_after >= output_len:
+        raise ValueError(f"Invalid split_after={split_after}, expected 0 < split_after < output_len")
+
+    config_a = SchedulerConfig(
+        model_path="/root/autodl-tmp/Meta-Llama-3-8B-Instruct",
         tp_info=DistributedInfo(0, 1),
         dtype=torch.bfloat16,
-        attention_backend="fi",
-        max_running_req=256,
-        cache_type="radix",
+        attention_backend=attn,
+        max_running_req=max(256, bs),
+        cache_type=cache_type,
         memory_ratio=0.9,
         cuda_graph_bs=[0],
         offline_mode=True,
     )
-    
-    scheduler_b = switch_model_a_to_b(scheduler_a, config_b)
+    scheduler_a = Scheduler(config_a)
 
-    kv_cache = scheduler_b.engine.kv_cache
-    if not hasattr(kv_cache, "segments"):
-        raise RuntimeError(
-            "KV cache is not segmented after switching. "
-            "Make sure new num_pages > old num_pages so extension happens."
-        )
-
-    seg2_start = int(kv_cache.segment_starts[1])
-
-    alloc_mode = os.environ.get("MINISGL_KV_ALLOC_MODE", "seg2")
-    if alloc_mode not in {"seg1", "seg2"}:
-        raise ValueError(f"Invalid MINISGL_KV_ALLOC_MODE={alloc_mode!r}, expected 'seg1' or 'seg2'")
-
-    free = scheduler_b.cache_manager._free_slots
-    if alloc_mode == "seg2":
-        mask = free >= seg2_start
-    else:
-        mask = free < seg2_start
-    scheduler_b.cache_manager._free_slots = torch.cat([free[mask], free[~mask]])
-    logger.info(
-        f"Reordered _free_slots: alloc_mode={alloc_mode}, seg2_start={seg2_start}, "
-        f"free_slots={len(scheduler_b.cache_manager._free_slots)}"
+    config_b = SchedulerConfig(
+        model_path="/root/autodl-tmp/Meta-Llama-3-8B-Instruct-GPTQ-4bit-gs128",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        attention_backend=attn,
+        max_running_req=max(256, bs),
+        cache_type=cache_type,
+        memory_ratio=0.9,
+        cuda_graph_bs=[0],
+        offline_mode=True,
     )
 
-    req0 = next((r for r in scheduler_b.decode_manager.running_reqs if r.uid == 0), None)
-    if req0 is None:
-        raise RuntimeError("Cannot find req uid=0 right after switching")
-    req0_table_idx = int(req0.table_idx)
-    prompt_len = int(len(input_ids))
+    scheduler_b = scheduler_a
 
-    # ========== 继续处理请求（使用模型B） ==========
-    logger.info("Continuing generation with Model B...")
-    
-    # 更新输出处理函数（使用模型B的tokenizer）
-    def offline_send_result_b(reply):
-        for msg in reply:
-            if msg.uid == 0:  # 我们的请求
-                token = msg.next_token
-                output_tokens.append(token)
-                output_state["count"] += 1
-                # 解码 token 到文本
-                token_text = scheduler_b.tokenizer.decode([token], skip_special_tokens=True)
-                output_state["text"] += token_text
-                logger.info(
-                    f"Model B - Token {output_state['count']}: {token_text!r} "
-                    f"(total: {output_state['text']!r})"
+    prompt_token_ids = [[randint(0, 10000) for _ in range(input_len)] for _ in range(bs)]
+    uids = list(range(0, bs))
+
+    def run_case(
+        name: str,
+        *,
+        switch_to_b: bool,
+        output_len_override: int | None = None,
+        split_after_override: int | None = None,
+        measure: bool = True,
+    ) -> None:
+        nonlocal scheduler_b
+        prompt_len = input_len
+        local_output_len = output_len if output_len_override is None else int(output_len_override)
+        local_split_after = split_after if split_after_override is None else int(split_after_override)
+
+        pending_msgs = deque(
+            [
+                UserMsg(
+                    uid=uid,
+                    input_ids=torch.tensor(prompt_token_ids[i], dtype=torch.int32),
+                    sampling_params=SamplingParams(
+                        ignore_eos=True,
+                        max_tokens=local_output_len,
+                        temperature=0.7,
+                        top_p=0.95,
+                        stop_token_ids=[128001, 128009],
+                    ),
                 )
-                if msg.finished:
-                    logger.info("Request finished!")
-    
-    # 设置 I/O 方法
-    scheduler_b.receive_msg = offline_receive_msg
-    scheduler_b.send_result = offline_send_result_b
-    
-    torch.cuda.synchronize(scheduler_b.engine.device)
-    t0 = time.perf_counter()
-
-    max_iterations = 400
-    iteration = 0
-
-    while output_state["count"] < 21 and iteration < max_iterations:
-        iteration += 1
-        try:
-            scheduler_b.normal_loop()
-        except Exception as e:
-            if "RequestAllFinished" in str(type(e).__name__):
-                break
-            raise
-
-    torch.cuda.synchronize(scheduler_b.engine.device)
-    t1 = time.perf_counter()
-    elapsed_s = t1 - t0
-
-    final_output = scheduler_b.tokenizer.decode(output_tokens, skip_special_tokens=True)
-    logger.info(f"Final output ({len(output_tokens)} tokens): {final_output!r}")
-    logger.info(f"Model B stage time (10 decode steps): {elapsed_s * 1000:.3f} ms")
-    logger.info("Request completed!")
-
-    kv_pages = scheduler_b.page_table[req0_table_idx, prompt_len : prompt_len + 20].to("cpu")
-    first10 = kv_pages[:10]
-    last10 = kv_pages[10:]
-
-    logger.info(
-        f"KV page indices for output tokens 1..20: first10(min={int(first10.min())}, max={int(first10.max())}), "
-        f"last10(min={int(last10.min())}, max={int(last10.max())}), seg2_start={seg2_start}"
-    )
-
-    if alloc_mode == "seg2":
-        assert torch.all(first10 < seg2_start), (
-            f"Expected first 10 KV pages in segment1 (<{seg2_start}), got {first10.tolist()}"
+                for i, uid in enumerate(uids)
+            ]
         )
-        assert torch.all(last10 >= seg2_start), (
-            f"Expected last 10 KV pages in segment2 (>= {seg2_start}), got {last10.tolist()}"
-        )
-        logger.info("Segment KV buffer check passed: first10 in segment1, last10 in segment2")
-    else:
-        assert torch.all(kv_pages < seg2_start), (
-            f"Expected KV pages all in segment1 (<{seg2_start}), got {kv_pages.tolist()}"
-        )
-        logger.info("Segment KV buffer check passed: all in segment1")
 
-    logger.info("Running reference generation without switching...")
+        counts = {uid: 0 for uid in uids}
+        table_idx0 = None
 
+        def min_cached_out() -> int:
+            vals = [
+                int(r.cached_len) - prompt_len
+                for r in scheduler_b.decode_manager.running_reqs
+                if r.uid in counts
+            ]
+            return min(vals) if vals else -1
+
+        def recv(blocking: bool = False):
+            _ = blocking
+            if not pending_msgs:
+                return []
+            msgs = list(pending_msgs)
+            pending_msgs.clear()
+            return msgs
+
+        def send(reply):
+            for m in reply:
+                if m.uid in counts:
+                    counts[m.uid] += 1
+
+        scheduler_b.receive_msg = recv
+        scheduler_b.send_result = send
+
+        it = 0
+        while min_cached_out() < local_split_after and it < 200000:
+            it += 1
+            normal_loop_no_throw(scheduler_b)
+            if table_idx0 is None:
+                r0 = next(
+                    (r for r in scheduler_b.decode_manager.running_reqs if r.uid == verify_uid),
+                    None,
+                )
+                if r0 is not None:
+                    table_idx0 = int(r0.table_idx)
+
+        if switch_to_b:
+            scheduler_b = switch_model_a_to_b(scheduler_b, config_b)
+            scheduler_b.receive_msg = recv
+            scheduler_b.send_result = send
+
+        t0 = None
+        if measure:
+            torch.cuda.synchronize(scheduler_b.engine.device)
+            t0 = time.perf_counter()
+
+        while min(counts.values()) < local_output_len and it < 400000:
+            it += 1
+            normal_loop_no_throw(scheduler_b)
+
+        if measure:
+            torch.cuda.synchronize(scheduler_b.engine.device)
+            t1 = time.perf_counter()
+
+        if min(counts.values()) < local_output_len:
+            raise RuntimeError(f"{name}: generation did not finish: min_count={min(counts.values())}")
+
+        if table_idx0 is not None:
+            kv_pages = scheduler_b.page_table[
+                table_idx0, prompt_len : prompt_len + local_output_len - 1
+            ].to("cpu")
+            assert torch.all(kv_pages < scheduler_b.engine.num_pages)
+
+        if measure:
+            assert t0 is not None
+            elapsed_s = t1 - t0
+            timed_tokens = bs * (local_output_len - local_split_after - 1)
+            tok_s = timed_tokens / elapsed_s
+            logger.info(
+                f"{name}: bs={bs} input_len={input_len} output_len={local_output_len} split_after={local_split_after} "
+                f"time_last={elapsed_s:.3f}s throughput_last={tok_s:.2f} tok/s"
+            )
+
+    reset_scheduler_state(scheduler_b)
+    run_case("a_then_b_same_kv_buffer1", switch_to_b=True)
+
+# ========== 使用示例 ==========
+if __name__ == "__main__":
+    from minisgl.utils import init_logger
+
+    logger = init_logger(__name__)
+
+    mode = os.environ.get("MINISGL_MODE", "oc_json").strip().lower()
+    if mode == "oc_json":
+        run_opencompass_json()
+        raise SystemExit(0)
+
+    if mode == "bench":
+        run_bench()
+        raise SystemExit(0)

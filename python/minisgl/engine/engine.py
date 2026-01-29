@@ -66,7 +66,8 @@ class Engine:
         
         if existing_kv_cache is not None:
             old_num_pages_actual = existing_kv_cache.num_pages
-            add_pages = self.num_pages
+            # add_pages = self.num_pages
+            add_pages = 0
             if add_pages > 0:
                 logger.info_rank0(
                     f"Extending KV cache from {old_num_pages_actual} to {old_num_pages_actual + add_pages} pages"
